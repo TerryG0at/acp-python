@@ -1,4 +1,5 @@
 import threading
+import json
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
@@ -82,14 +83,36 @@ def buyer(use_thread_lock: bool = True):
         safe_append_job(job, memo_to_sign)
         job_event.set()
 
+    def extract_text_deliverable(job) -> str:
+        for m in job.memos or []:
+            content = getattr(m, "content", None)
+            if isinstance(content, dict) and content.get("type") == "text":
+                return str(content.get("value", ""))
+            if isinstance(content, str):
+                try:
+                    data = json.loads(content)
+                    if data.get("type") == "text":
+                        return str(data.get("value", ""))
+                except Exception:
+                    pass
+        return ""
+
     def on_evaluate(job: ACPJob):
-        print("Evaluation function called", job.memos)
+        quiz_md = extract_text_deliverable(job)
+        if quiz_md:
+            print("\n===== DELIVERABLE (MCQ) =====\n")
+            print(quiz_md)
+            print("\n=============================\n")
+        else:
+            print("No text deliverable found on this job.")
+
+        # accept completion
         for memo in job.memos:
             if memo.next_phase == ACPJobPhase.COMPLETED:
                 job.evaluate(True)
                 break
 
-    def process_job(job: ACPJob, memo_to_sign: Optional[ACPMemo] = None):
+    def process_job(job, memo_to_sign=None):
         if job.phase == ACPJobPhase.NEGOTIATION:
             for memo in job.memos:
                 if memo.next_phase == ACPJobPhase.TRANSACTION:
@@ -111,38 +134,50 @@ def buyer(use_thread_lock: bool = True):
         entity_id=env.BUYER_ENTITY_ID
     )
 
-    # Browse available agents based on a keyword and cluster name
-    relevant_agents = acp.browse_agents(
-        keyword="NerdyLexy",
-        cluster=None,
-        sort_by=[
-            ACPAgentSort.SUCCESSFUL_JOB_COUNT,
-        ],
+    # find your seller (by name or keyword)
+    agents = acp.browse_agents(
+        keyword="NerdyLexy",          # or any keyword/tag you set
+        sort_by=[ACPAgentSort.SUCCESSFUL_JOB_COUNT],
         top_k=5,
         graduation_status=ACPGraduationStatus.ALL,
         online_status=ACPOnlineStatus.ALL
     )
-    print(f"Relevant agents: {relevant_agents}")
+    if not agents:
+        print("No agents found.")
+        return
+    seller = agents[0]
+    offering = seller.offerings[0]    # pick “MCQ” offering
 
-    # Pick one of the agents based on your criteria (in this example we just pick the first one)
-    chosen_agent = relevant_agents[0]
+    print("\nType requests like:  topic=Fish  num=5")
+    print("Press ENTER to use defaults; type 'q' to quit.\n")
 
-    # Pick one of the service offerings based on your criteria (in this example we just pick the first one)
-    chosen_job_offering = chosen_agent.offerings[0]
+    while True:
+        raw = input("Request> ").strip()
+        if raw.lower() in {"q", "quit", "exit"}:
+            break
 
-    with initiate_job_lock:
-        job_id = chosen_job_offering.initiate_job(
-            # <your_schema_field> can be found in your ACP Visualiser's "Edit Service" pop-up.
-            # Reference: (./images/specify_requirement_toggle_switch.png)
-            service_requirement={"Company Name": "OpenAI"},
+        # Parse k=v pairs typed in terminal
+        data = dict(x.split("=", 1) for x in raw.split() if "=" in x)
+        topic = data.get("topic", "general knowledge")
+        num = int(data.get("num", "5"))
+        text = data.get("text", "")  # optional notes
+
+        # Send exactly these to the seller
+        service_requirement = {
+            "topic": topic,
+            "num": num,
+            "text": text
+        }
+
+        job_id = offering.initiate_job(
+            service_requirement=service_requirement,
             evaluator_address=env.BUYER_AGENT_WALLET_ADDRESS,
-            expired_at=datetime.now() + timedelta(days=1)
+            expired_at=datetime.now() + timedelta(hours=2),
         )
-        print(f"Job {job_id} initiated.")
+        print(f"Job {job_id} initiated. Waiting for negotiation/payment/evaluation...\n")
 
-    print("Listening for next steps...")
+    # keep listening
     threading.Event().wait()
-
 
 if __name__ == "__main__":
     buyer()

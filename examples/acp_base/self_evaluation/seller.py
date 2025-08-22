@@ -1,5 +1,6 @@
 import threading
 import time
+import json
 from collections import deque
 from typing import Optional
 
@@ -10,6 +11,10 @@ from virtuals_acp.env import EnvSettings
 
 load_dotenv(override=True)
 
+from groq import Groq
+import os
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def seller(use_thread_lock: bool = True):
     env = EnvSettings()
@@ -82,24 +87,70 @@ def seller(use_thread_lock: bool = True):
         safe_append_job(job, memo_to_sign)
         job_event.set()
 
+    def extract_requirement_from_memos(job) -> dict:
+        """Return the first serviceRequirement found in job memos."""
+        for m in job.memos or []:
+            content = getattr(m, "content", None)
+            if isinstance(content, dict):
+                sr = content.get("serviceRequirement")
+                if sr is not None:
+                    return sr
+            elif isinstance(content, str):
+                try:
+                    data = json.loads(content)
+                    sr = data.get("serviceRequirement")
+                    if sr is not None:
+                        return sr
+                except Exception:
+                    pass
+        return {}
+
     def process_job(job: ACPJob, memo_to_sign: Optional[ACPMemo] = None):
         if (
-                job.phase == ACPJobPhase.REQUEST and
-                memo_to_sign is not None and
-                memo_to_sign.next_phase == ACPJobPhase.NEGOTIATION
+            job.phase == ACPJobPhase.REQUEST
+            and memo_to_sign is not None
+            and memo_to_sign.next_phase == ACPJobPhase.NEGOTIATION
         ):
             job.respond(True)
+
         elif (
-                job.phase == ACPJobPhase.TRANSACTION and
-                memo_to_sign is not None and
-                memo_to_sign.next_phase == ACPJobPhase.EVALUATION
+            job.phase == ACPJobPhase.TRANSACTION
+            and memo_to_sign is not None
+            and memo_to_sign.next_phase == ACPJobPhase.EVALUATION
         ):
             print(f"Delivering job {job.id}")
-            deliverable = IDeliverable(
-                type="url",
-                value="https://example.com"
+
+            # --- get requirement from memos ---
+            req = extract_requirement_from_memos(job)
+
+            topic = (req.get("topic") or "general knowledge").strip()
+            try:
+                num_q = int(req.get("num", 5))
+            except Exception:
+                num_q = 5
+            num_q = max(1, min(num_q, 10))
+
+            notes = (req.get("text") or "").strip()  # optional; can be empty
+
+            # --- Call Groq to generate MCQs ---
+            prompt = f"""
+            Create {num_q} MCQs about "{topic}".
+            - Each question must have 4 options (A–D)
+            - Indicate the correct option letter after each question
+            - Use clear, concise wording
+            Return the quiz in Markdown.
+            Source notes (may be empty):
+            {notes}
+            """
+
+            response = groq_client.chat.completions.create(
+                model="llama3-70b-8192",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
             )
-            job.deliver(deliverable)
+            quiz_md = response.choices[0].message.content or "# Quiz (MCQ)\n\n(Empty response)"
+            job.deliver(IDeliverable(type="text", value=quiz_md))
+
         elif job.phase == ACPJobPhase.COMPLETED:
             print("Job completed", job)
         elif job.phase == ACPJobPhase.REJECTED:
