@@ -1,8 +1,16 @@
+import os
+import json
 import threading
 import time
-import json
 from collections import deque
-from typing import Optional
+from typing import Optional, List
+
+# numeric / model deps
+import numpy as np
+try:
+    import joblib  # pip install joblib
+except ImportError:
+    joblib = None
 
 from dotenv import load_dotenv
 
@@ -11,11 +19,78 @@ from virtuals_acp.env import EnvSettings
 
 load_dotenv(override=True)
 
-from groq import Groq
-import os
+# ----------------------------
+# Model artifacts (YOUR files)
+# ----------------------------
+MODEL_PATH  = os.path.join("model", "bitcoin_price_model.pkl")
+SCALER_PATH = os.path.join("model", "bitcoin_price_scaler.pkl")
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL = None
+SCALER = None
 
+def _load_artifacts():
+    global MODEL, SCALER
+    if joblib is None:
+        print("joblib not installed. Run: pip install joblib")
+        return
+    if os.path.exists(MODEL_PATH):
+        try:
+            MODEL = joblib.load(MODEL_PATH)
+            print(f"Loaded model: {MODEL_PATH}")
+        except Exception as e:
+            print(f"Failed to load model: {e}")
+    else:
+        print(f"Model file not found at {MODEL_PATH}")
+
+    if os.path.exists(SCALER_PATH):
+        try:
+            SCALER = joblib.load(SCALER_PATH)
+            print(f"Loaded scaler: {SCALER_PATH}")
+        except Exception as e:
+            print(f"Failed to load scaler: {e}")
+    else:
+        print("Scaler not provided (optional).")
+
+def prepare_features(prices: List[float]) -> np.ndarray:
+    """
+    Build one feature row from the last N prices where N is
+    the model's n_features_in_ if available, else 30.
+    Applies the scaler if provided.
+    """
+    if MODEL is None:
+        raise RuntimeError("MODEL not loaded")
+
+    if hasattr(MODEL, "n_features_in_"):
+        window = int(MODEL.n_features_in_)
+    else:
+        window = 30  # fallback if model doesn't expose it
+
+    if len(prices) < window:
+        raise ValueError(f"Need at least {window} prices, got {len(prices)}")
+
+    x = np.array(prices[-window:], dtype=float)
+    if SCALER is not None:
+        x = SCALER.transform(x.reshape(-1, 1)).ravel()
+
+    return x.reshape(1, -1)
+
+def predict_next(prices: List[float], horizon_days: int = 1) -> float:
+    """
+    Predict next-day BTC price with your trained model.
+    If anything fails, fall back to a simple moving average.
+    """
+    try:
+        X = prepare_features(prices)
+        y_hat = MODEL.predict(X)
+        return float(np.asarray(y_hat).ravel()[0])
+    except Exception as e:
+        print(f"[predict_next] Falling back due to: {e}")
+        k = min(5, len(prices))
+        return float(sum(prices[-k:]) / k)
+
+# -------------------------------------------------
+# ACP seller: same structure, different deliverable
+# -------------------------------------------------
 def seller(use_thread_lock: bool = True):
     env = EnvSettings()
 
@@ -26,36 +101,28 @@ def seller(use_thread_lock: bool = True):
     if env.SELLER_ENTITY_ID is None:
         raise ValueError("SELLER_ENTITY_ID is not set")
 
+    # load ML artifacts once
+    _load_artifacts()
+
     job_queue = deque()
     job_queue_lock = threading.Lock()
     job_event = threading.Event()
 
     def safe_append_job(job, memo_to_sign: Optional[ACPMemo] = None):
         if use_thread_lock:
-            print(f"[safe_append_job] Acquiring lock to append job {job.id}")
             with job_queue_lock:
-                print(f"[safe_append_job] Lock acquired, appending job {job.id} to queue")
                 job_queue.append((job, memo_to_sign))
         else:
             job_queue.append((job, memo_to_sign))
 
     def safe_pop_job():
         if use_thread_lock:
-            print(f"[safe_pop_job] Acquiring lock to pop job")
             with job_queue_lock:
                 if job_queue:
-                    job, memo_to_sign = job_queue.popleft()
-                    print(f"[safe_pop_job] Lock acquired, popped job {job.id}")
-                    return job, memo_to_sign
-                else:
-                    print("[safe_pop_job] Queue is empty after acquiring lock")
+                    return job_queue.popleft()
         else:
             if job_queue:
-                job, memo_to_sign = job_queue.popleft()
-                print(f"[safe_pop_job] Popped job {job.id} without lock")
-                return job, memo_to_sign
-            else:
-                print("[safe_pop_job] Queue is empty (no lock)")
+                return job_queue.popleft()
         return None, None
 
     def job_worker():
@@ -65,8 +132,11 @@ def seller(use_thread_lock: bool = True):
                 job, memo_to_sign = safe_pop_job()
                 if not job:
                     break
-                # Process each job in its own thread to avoid blocking
-                threading.Thread(target=handle_job_with_delay, args=(job, memo_to_sign), daemon=True).start()
+                threading.Thread(
+                    target=handle_job_with_delay,
+                    args=(job, memo_to_sign),
+                    daemon=True
+                ).start()
             if use_thread_lock:
                 with job_queue_lock:
                     if not job_queue:
@@ -78,12 +148,12 @@ def seller(use_thread_lock: bool = True):
     def handle_job_with_delay(job, memo_to_sign):
         try:
             process_job(job, memo_to_sign)
-            time.sleep(2)
+            time.sleep(1.5)
         except Exception as e:
-            print(f"\u274c Error processing job: {e}")
+            print(f"❌ Error processing job: {e}")
 
     def on_new_task(job: ACPJob, memo_to_sign: Optional[ACPMemo] = None):
-        print(f"[on_new_task] Received job {job.id} (phase: {job.phase})")
+        print(f"[on_new_task] job {job.id} (phase: {job.phase})")
         safe_append_job(job, memo_to_sign)
         job_event.set()
 
@@ -118,57 +188,48 @@ def seller(use_thread_lock: bool = True):
             and memo_to_sign is not None
             and memo_to_sign.next_phase == ACPJobPhase.EVALUATION
         ):
-            print(f"Delivering job {job.id}")
-
-            # --- get requirement from memos ---
+            # ---- Prediction service here ----
             req = extract_requirement_from_memos(job)
 
-            topic = (req.get("topic") or "general knowledge").strip()
-            try:
-                num_q = int(req.get("num", 5))
-            except Exception:
-                num_q = 5
-            num_q = max(1, min(num_q, 10))
+            prices = req.get("prices", [])
+            horizon = int(req.get("horizonDays", 1))
 
-            notes = (req.get("text") or "").strip()  # optional; can be empty
+            # basic validation
+            if not isinstance(prices, list) or not all(isinstance(x, (int, float)) for x in prices):
+                job.deliver(IDeliverable(
+                    type="text",
+                    value="Invalid 'prices': supply an array of numbers (oldest → newest)."
+                ))
+                return
 
-            # --- Call Groq to generate MCQs ---
-            prompt = f"""
-            Create {num_q} MCQs about "{topic}".
-            - Each question must have 4 options (A–D)
-            - Indicate the correct option letter after each question
-            - Use clear, concise wording
-            Return the quiz in Markdown.
-            Source notes (may be empty):
-            {notes}
-            """
+            horizon = max(1, min(horizon, 7))
 
-            response = groq_client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
+            pred = predict_next(prices, horizon)
+
+            md = (
+                "## BTC Price Prediction\n\n"
+                f"- Horizon: **{horizon} day(s)**\n"
+                f"- Last known price: **${prices[-1]:,.2f}**\n"
+                f"- Predicted price in {horizon} day(s): **${pred:,.2f}**\n"
             )
-            quiz_md = response.choices[0].message.content or "# Quiz (MCQ)\n\n(Empty response)"
-            job.deliver(IDeliverable(type="text", value=quiz_md))
+            job.deliver(IDeliverable(type="text", value=md))
 
         elif job.phase == ACPJobPhase.COMPLETED:
-            print("Job completed", job)
+            print(f"Job completed {job.id}")
         elif job.phase == ACPJobPhase.REJECTED:
-            print("Job rejected", job)
+            print(f"Job rejected {job.id}")
 
     threading.Thread(target=job_worker, daemon=True).start()
 
-    # Initialize the ACP client
     VirtualsACP(
         wallet_private_key=env.WHITELISTED_WALLET_PRIVATE_KEY,
         agent_wallet_address=env.SELLER_AGENT_WALLET_ADDRESS,
         on_new_task=on_new_task,
-        entity_id=env.SELLER_ENTITY_ID
+        entity_id=env.SELLER_ENTITY_ID,
     )
 
     print("Waiting for new task...")
     threading.Event().wait()
-
 
 if __name__ == "__main__":
     seller()
