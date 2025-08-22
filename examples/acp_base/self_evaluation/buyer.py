@@ -153,7 +153,7 @@ def buyer(use_thread_lock: bool = True):
     offering = seller.offerings[OFFERING_INDEX]
 
     print("\nEnter requests like:")
-    print("  prices=30000,30120,30050,30210,30300 horizonDays=1")
+    print("  prices=30000 horizonDays=1")
     print("Press ENTER to re-use last prices; type 'q' to quit.\n")
 
     last_prices = None
